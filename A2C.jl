@@ -15,14 +15,15 @@ using Statistics
 using Printf
 using Plots
 
-include("data.jl")  # Import the data
+include("data.jl")              # Import the data
+include("shared_scenarios.jl") # Shared evaluation scenarios
 
 # ─────────────────────────────────────────────────────────────────
 # 1. CONSTANTS AND DATA PREPARATION
 # ─────────────────────────────────────────────────────────────────
 
 const N_SYSTEMS = 4
-const T_HORIZON = 120  # set to 120 for full long-term run
+const T_HORIZON = 24  # set to 120 for full long-term run
 
 # exp_mu: 12×4 matrix of expected inflows per month per subsystem
 exp_mu = reduce(vcat, [EXP_MEANS[m]' for m in 1:12])   # 12×4
@@ -382,6 +383,90 @@ function evaluate(agent::A2CAgent; n_episodes=20, seed=100)
     return costs
 end
 
+function evaluate_detailed(agent; n_episodes=5, seed=100)
+    for ep in 1:n_episodes
+        env = HydrothermalEnv(T_HORIZON; seed=seed + ep)
+        obs = reset!(env)
+        done = false
+        monthly_hydro = Float64[]
+        monthly_thermal = Float64[]
+        monthly_deficit = Float64[]
+        monthly_spill = Float64[]
+        monthly_exchange = Float64[]
+
+        while !done
+            μ = agent.actor(obs)
+            a = sigmoid.(μ)
+
+            month = mod1(env.t + 1, 12)
+            demand_t = demand_mat[month, :]
+            avail = env.stored .+ env.inflow
+
+            hydro = Float64.(a[1:4]) .* min.(hydro_gen_ub, avail)
+            thermal_units = thermal_unit_lb .+ Float64.(a[5:4+N_THERMAL_TOTAL]) .* (thermal_unit_ub .- thermal_unit_lb)
+            thermal = [sum(thermal_units[thermal_idx[i]]) for i in 1:4]
+            spill = Float64.(a[9:12]) .* env.stored .* 0.1
+            deficit = clamp.(demand_t .- hydro .- thermal, 0.0, demand_t .* deficit_ub_frac)
+            a_exch = reshape(Float64.(sigmoid.(μ[13:37])), 5, 5) .* exchange_ub_mat
+
+            push!(monthly_exchange, sum(a_exch))
+            push!(monthly_hydro, sum(hydro))
+            push!(monthly_thermal, sum(thermal))
+            push!(monthly_deficit, sum(deficit))
+            push!(monthly_spill, sum(spill))
+
+            obs, _, done, _ = env_step!(env, μ)
+        end
+
+        @printf "\nEpisode %d:\n" ep
+        @printf "  Avg hydro:    %8.1f MW\n" mean(monthly_hydro)
+        @printf "  Avg thermal:  %8.1f MW\n" mean(monthly_thermal)
+        @printf "  Avg deficit:  %8.1f MW\n" mean(monthly_deficit)
+        @printf "  Avg spill:    %8.1f MW\n" mean(monthly_spill)
+        @printf "  Avg exchange: %8.1f MW\n" mean(monthly_exchange)
+    end
+end
+
+"""
+evaluate_on_scenarios(agent, scenarios_inflow)
+
+Replay pre-generated inflow trajectories from shared_scenarios.jl so that
+A2C and SDDP are evaluated on identical stochastic realisations.
+
+After each env_step!, the inflow sampled internally is discarded and replaced
+with the next pre-generated value, then get_obs is called again to produce a
+consistent observation.
+"""
+function evaluate_on_scenarios(agent::A2CAgent,
+    scenarios_inflow::Vector{Vector{Vector{Float64}}})
+    costs = Float64[]
+    T = length(scenarios_inflow[1])
+    for scenario in scenarios_inflow
+        env = HydrothermalEnv(T)
+        env.inflow = copy(scenario[1])   # use pre-generated initial inflow
+        obs = get_obs(env)
+        ep_cost = 0.0
+        done = false
+        step = 1
+        while !done
+            μ = agent.actor(obs)
+            _, _, done, cost = env_step!(env, μ)
+            ep_cost += cost
+            step += 1
+            # Override the inflow that env_step! just sampled with the scenario value
+            if !done && step <= T
+                env.inflow = copy(scenario[step])
+                obs = get_obs(env)
+            end
+        end
+        push!(costs, ep_cost)
+    end
+    @printf "\nA2C Evaluation on shared scenarios (%d scenarios, T=%d):\n" length(scenarios_inflow) T
+    @printf "  Mean total cost : %8.2f M R\$\n" mean(costs) / 1e6
+    @printf "  Std             : %8.2f M R\$\n" std(costs) / 1e6
+    return costs
+end
+
 # ─────────────────────────────────────────────────────────────────
 # 8. MAIN
 # ─────────────────────────────────────────────────────────────────
@@ -400,5 +485,15 @@ plot!(p, smooth ./ 1e6, lw=2, label="$(smooth_n)-ep moving avg")
 savefig(p, "a2c_learning_curve.png")
 println("Learning curve saved → a2c_learning_curve.png")
 
-# ── Final evaluation ──────────────────────────────────────────────
-eval_costs = evaluate(agent)
+# ── Standard evaluation (random inflows, for reference) ──────────
+#eval_costs = evaluate(agent)
+eval_costs = evaluate_detailed(agent)
+
+# ── Shared-scenario evaluation (comparable with sddp_ts_2.jl) ────
+const N_EVAL = 100
+const EVAL_SEED = 100
+scenarios_inflow, _ = generate_eval_scenarios(
+    N_EVAL, T_HORIZON, gamma_mat, sigma_mats, exp_mu,
+    inflow_initial; seed=EVAL_SEED
+)
+shared_eval_costs = evaluate_on_scenarios(agent, scenarios_inflow)
