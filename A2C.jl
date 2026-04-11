@@ -96,36 +96,40 @@ function HydrothermalEnv(horizon=T_HORIZON; seed=nothing)
     HydrothermalEnv(0, copy(stored_initial), copy(inflow_initial), rng, horizon)
 end
 
-# Observation: month(1) + stored_norm(4) + inflow_norm(4) = 9
-obs_dim() = 1 + N_SYSTEMS + N_SYSTEMS
+# # Observation: month(1) + stored_norm(4) + inflow_norm(4) = 9
+# obs_dim() = 1 + N_SYSTEMS + N_SYSTEMS
+
+obs_dim() = 1 + N_SYSTEMS + N_SYSTEMS + N_SYSTEMS # Month + Storage + Inflow + Demand
 
 # Action: hydro(4) + spill(4) + exchange(25) = 33
 act_dim() = N_SYSTEMS + N_SYSTEMS + 25
 
+
 # function get_obs(env::HydrothermalEnv)
-#     month = mod1(env.t + 1, 12)
-#     demand_t = demand_mat[month, :]
+#     # 1. Normalize time (Month 1 to 12 -> 0.08 to 1.0)
+#     month_norm = Float32[mod1(env.t, 12)/12.0]
 
-#     stored_norm = env.stored ./ stored_ub
-#     inflow_norm = env.inflow ./ (exp_mu[month, :] .+ 1e-8)
+#     # 2. Normalize storage (0 to stored_ub -> 0.0 to 1.0)
+#     stored_norm = Float32.(env.stored ./ stored_ub)
 
-#     # surplus: positive = can export, negative = needs imports
-#     avail_hydro = min.(hydro_gen_ub, env.stored .+ env.inflow)
-#     surplus_norm = (avail_hydro .+ thermal_agg_ub .- demand_t) ./ (demand_t .+ 1e-8)
+#     # 3. Normalize inflow (divide by a safe physical upper bound, e.g., 100,000 MW)
+#     inflow_norm = Float32.(env.inflow ./ 100000.0)
 
-#     Float32.(vcat(stored_norm, inflow_norm, surplus_norm))
+#     return vcat(month_norm, stored_norm, inflow_norm)
 # end
+
+# 2. Update the get_obs function:
 function get_obs(env::HydrothermalEnv)
-    # 1. Normalize time (Month 1 to 12 -> 0.08 to 1.0)
-    month_norm = Float32[mod1(env.t, 12)/12.0]
+    month = mod1(env.t + 1, 12)
 
-    # 2. Normalize storage (0 to stored_ub -> 0.0 to 1.0)
+    month_norm = Float32[month/12.0]
     stored_norm = Float32.(env.stored ./ stored_ub)
-
-    # 3. Normalize inflow (divide by a safe physical upper bound, e.g., 100,000 MW)
     inflow_norm = Float32.(env.inflow ./ 100000.0)
 
-    return vcat(month_norm, stored_norm, inflow_norm)
+    # NEW: Explicit Demand Normalization (Divided by ~30k max regional demand)
+    demand_norm = Float32.(demand_mat[month, :] ./ 30000.0)
+
+    return vcat(month_norm, stored_norm, inflow_norm, demand_norm)
 end
 
 function reset!(env::HydrothermalEnv)
@@ -158,116 +162,91 @@ end
 function env_step!(env::HydrothermalEnv, raw_action::Vector{Float32})
     month = mod1(env.t + 1, 12)
     demand_t = demand_mat[month, :]
-    a = sigmoid.(raw_action)
 
+    # 🔥 SHIFTED SIGMOIDS: Injecting domain knowledge into the NN 🔥
+    a_hydro = sigmoid.(raw_action[1:4] .+ 3.0f0)  # Defaults to 95% (Keep lights on)
+    a_exch = sigmoid.(raw_action[9:33] .- 3.0f0) # Defaults to 4% (Isolate regions initially)
+
+
+    #a = sigmoid.(raw_action)
+    a = sigmoid.(raw_action .* 3.0f0)
+
+    # 1. ── Initial Exchange Mapping ──
     exchange = reshape(Float64.(a[9:33]), 5, 5) .* exchange_ub_mat
     for i in 1:5
         exchange[i, i] = 0.0
     end
 
-    # 💥 THE REAL FIX: Transshipment Balance (Total In = Total Out)
-    inflow_5 = sum(exchange[1:4, 5])         # Total power arriving at Node 5
-    outflow_5_proposed = sum(exchange[5, 1:4]) # Total power agent wants to leave Node 5
+    # 2. ── PERFECT HUB BALANCE (Node 5) ──
+    exchange[5, 1:4] .= clamp.(exchange[5, 1:4], 0.0, exchange_ub_mat[5, 1:4])
+    actual_hub_out = sum(exchange[5, 1:4])
+    in_to_5 = sum(exchange[1:4, 5])
+    hub_flow = min(in_to_5, actual_hub_out)
 
-    if outflow_5_proposed > 1e-8
-        # Scale the exports so they perfectly match the imports
-        exchange[5, 1:4] .= exchange[5, 1:4] .* (inflow_5 / outflow_5_proposed)
-    else
-        # If agent guessed 0, just distribute the inflow evenly so it doesn't get trapped
-        exchange[5, 1:4] .= inflow_5 / 4.0
+    if in_to_5 > 1e-5
+        exchange[1:4, 5] .*= (hub_flow / in_to_5)
     end
+    if actual_hub_out > 1e-5
+        exchange[5, 1:4] .*= (hub_flow / actual_hub_out)
+    end
+    exchange = clamp.(exchange, 0.0, exchange_ub_mat)
 
-    exchange = clamp.(exchange, 0.0, exchange_ub_mat)  # Ensure this scaling didn't violate physical line limits
-
-    # 2. ── Target Load per Region ──────────────────────────────────
+    # 3. ── Target Load ──
     target_load = zeros(4)
     for i in 1:4
-        net_export = sum(exchange[i, :]) - sum(exchange[:, i])
-        target_load[i] = demand_t[i] + net_export
+        target_load[i] = demand_t[i] + sum(exchange[i, :]) - sum(exchange[:, i])
     end
 
-    # 3. ── Hydro (Strategic) ───────────────────────────────────────
+    # 4. ── Hydro Generation ──
     avail_water = env.stored .+ env.inflow
+    #hydro_gen = Float64.(a[1:4]) .* min.(hydro_gen_ub, avail_water, max.(0.0, target_load))
+    hydro_gen = Float64.(a_hydro) .* min.(hydro_gen_ub, avail_water, max.(0.0, target_load))
 
-    # Agent's intended hydro, bounded by physical limits AND target load
-    # (We don't let it generate more hydro than the target load, avoiding wasted energy)
-    max_useful_hydro = min.(hydro_gen_ub, avail_water, max.(0.0, target_load))
-    hydro_gen = Float64.(a[1:4]) .* max_useful_hydro
-
-    # 4. ── Thermal & Deficit (Reactive / Automatic) ────────────────
-    thermal_gen_total = zeros(4)
+    # 5. ── THERMAL & DEFICIT (Pure Merit Order - Cost Tracking) ──
     thermal_cost = 0.0
-    deficit = zeros(4)
-
-    # We will track the dispatch of each individual unit for exact costing
-    thermal_units_dispatched = zeros(N_THERMAL_TOTAL)
+    deficit_cost = 0.0
 
     for i in 1:4
-        # How much demand is left after Hydro?
-        remaining_load = target_load[i] - hydro_gen[i]
+        remaining = target_load[i] - hydro_gen[i]
 
-        # If there is remaining load, dispatch thermal units
-        if remaining_load > 0
-            # Get the indices of thermal units in this region
-            units_in_region = thermal_idx[i]
-
-            # Sort these units by cost (cheapest first) to mimic SDDP LP behavior
-            sorted_units = sort(units_in_region, by=x -> thermal_unit_cost[x])
-
+        # A. Dispatch Thermal
+        if remaining > 0
+            sorted_units = sort(thermal_idx[i], by=u -> thermal_unit_cost[u])
             for u in sorted_units
-                if remaining_load <= 0
-                    break
-                end
-
-                # Turn on the unit up to its max capacity or the remaining load
-                unit_capacity = thermal_unit_ub[u] # Assuming lower bound is 0 for simplicity
-                gen = min(remaining_load, unit_capacity)
-
-                thermal_units_dispatched[u] = gen
-                thermal_cost += gen * thermal_unit_cost[u]
-                thermal_gen_total[i] += gen
-                remaining_load -= gen
+                remaining <= 0 && break
+                gen = min(remaining, thermal_unit_ub[u])
+                thermal_cost += gen * thermal_unit_cost[u]  # Calculate R$ Cost
+                remaining -= gen
             end
         end
 
-        # If we exhausted all thermal units and still have load, it becomes a deficit
-        deficit[i] = max(0.0, remaining_load)
+        # B. Deficit (Piecewise Tiers for exact SDDP matching)
+        if remaining > 0
+            for j in 1:4
+                seg_ub = demand_t[i] * deficit_ub_frac[j]
+                used_def = min(remaining, seg_ub)
+                deficit_cost += used_def * deficit_obj_vec[j] # Calculate R$ Cost
+                remaining -= used_def
+                remaining <= 0 && break
+            end
+        end
     end
 
-    # 5. ── Exact Mass Balance & Spill ──────────────────────────────
+    # 6. ── SPILL (Physics Only) ──
     temp_stored = avail_water .- hydro_gen
-
-    spill_intended = Float64.(a[5:8]) .* avail_water
-    forced_spill = max.(0.0, temp_stored .- stored_ub)
-    spill = min.(max.(spill_intended, forced_spill), temp_stored)
-
+    spill = max.(0.0, temp_stored .- stored_ub)
     new_stored = temp_stored .- spill
 
-    # 6. ── Cost Calculation ────────────────────────────────────────
-    deficit_cost = dot(deficit_obj_vec, deficit)
-    spill_cost_val = SPILL_COST * sum(spill)
-    exchange_vol_penalty = 0.0001 * sum(exchange)
-
-    # The imbalance penalty is GONE because the logic above mathematically guarantees balance!
-    total_cost = thermal_cost + deficit_cost + spill_cost_val + exchange_vol_penalty
-
+    # 7. ── Finalize ──
+    # Note: Assuming you have a constant SPILL_COST (e.g., 1.0 or 0.01) defined globally
+    total_cost = thermal_cost + deficit_cost + (1.0 * sum(spill))
     reward = Float32(-total_cost / 1e8)
 
-
-    # 6. ── Cost Calculation (Perfectly Aligned with SDDP) ──────────
-    spill_cost_val = SPILL_COST * sum(spill)
-
-    # Removed exchange_vol_penalty to match SDDP objective
-    total_cost = thermal_cost + deficit_cost + spill_cost_val
-    reward = Float32(-total_cost / 1e8)
-
-    # 7. ── Advance state ───────────────────────────────────────────
     env.stored = new_stored
     env.t += 1
     env.inflow = sample_inflow(env.t, env.inflow, env.rng)
-    done = env.t >= env.horizon
 
-    return get_obs(env), reward, done, total_cost
+    return get_obs(env), reward, (env.t >= env.horizon), total_cost
 end
 
 
@@ -353,7 +332,7 @@ end
 const GAMMA = 0.99f0
 const LR = 3f-4
 const N_STEPS = 12       # one full seasonal cycle per update
-const N_EPISODES = 5_000
+const N_EPISODES = 50_000
 
 function train_a2c(; seed=42, n_episodes=N_EPISODES)
     rng = MersenneTwister(seed)
@@ -464,59 +443,79 @@ function evaluate_detailed(agent; n_episodes=5, seed=100)
 
         while !done
             μ = agent.actor(obs)
-            a = sigmoid.(μ)
+            #a = sigmoid.(μ)
+            a = sigmoid.(μ .* 3.0f0)
             month = mod1(env.t + 1, 12)
             demand_t = demand_mat[month, :]
 
-            # 1. Exchange (Strategic - indices 9 to 33)
+            # 🔥 SHIFTED SIGMOIDS (For Evaluation) 🔥
+            a_hydro = sigmoid.(μ[1:4] .+ 3.0f0)
+            a_exch = sigmoid.(μ[9:33] .- 3.0f0)
+
+            # 1. ── EXACT HUB BALANCE MATH ──
             exch = reshape(Float64.(a[9:33]), 5, 5) .* exchange_ub_mat
             for i in 1:5
                 exch[i, i] = 0.0
             end
-            inflow_5 = sum(exch[1:4, 5])
-            outflow_5 = sum(exch[5, 1:4])
-            if outflow_5 > 1e-8
-                exch[5, 1:4] .+= (inflow_5 - outflow_5) .* exch[5, 1:4] ./ outflow_5
+
+            exch[5, 1:4] .= clamp.(exch[5, 1:4], 0.0, exchange_ub_mat[5, 1:4])
+            actual_hub_out = sum(exch[5, 1:4])
+            in_to_5 = sum(exch[1:4, 5])
+            hub_flow = min(in_to_5, actual_hub_out)
+
+            if in_to_5 > 1e-5
+                exch[1:4, 5] .*= (hub_flow / in_to_5)
+            end
+            if actual_hub_out > 1e-5
+                exch[5, 1:4] .*= (hub_flow / actual_hub_out)
             end
             exch = clamp.(exch, 0.0, exchange_ub_mat)
 
-            # 2. Target Load per subsystem
-            target_load = [demand_t[i] + sum(exch[i, :]) - sum(exch[:, i]) for i in 1:4]
+            # 2. ── TARGET LOAD ──
+            target_load = zeros(4)
+            for i in 1:4
+                target_load[i] = demand_t[i] + sum(exch[i, :]) - sum(exch[:, i])
+            end
 
-            # 3. Hydro (Strategic - indices 1 to 4)
+            # 3. ── HYDRO ──
             avail = env.stored .+ env.inflow
-            max_useful_hydro = min.(hydro_gen_ub, avail, max.(0.0, target_load))
-            hydro = Float64.(a[1:4]) .* max_useful_hydro
+            #hydro = Float64.(a[1:4]) .* min.(hydro_gen_ub, avail, max.(0.0, target_load))
+            hydro = Float64.(a_hydro) .* min.(hydro_gen_ub, avail, max.(0.0, target_load))
 
-            # 4. Thermal & Deficit (Reactive merit-order dispatch)
-            thermal = zeros(4)
-            deficit = zeros(4)
+            # 4. ── THERMAL & DEFICIT (Pure Merit Order - MW Tracking) ──
+            thermal_total = 0.0
+            deficit_total = 0.0
             for i in 1:4
                 remaining = target_load[i] - hydro[i]
+
+                # A. Dispatch Thermal
                 if remaining > 0
                     sorted_units = sort(thermal_idx[i], by=u -> thermal_unit_cost[u])
                     for u in sorted_units
                         remaining <= 0 && break
                         gen = min(remaining, thermal_unit_ub[u])
-                        thermal[i] += gen
+                        thermal_total += gen  # Track MW
                         remaining -= gen
                     end
                 end
-                deficit[i] = max(0.0, remaining)
+
+                # B. Deficit (Whatever MW is left over)
+                if remaining > 0
+                    deficit_total += remaining  # Track MW
+                end
             end
 
-            # 5. Spill (Strategic - indices 5 to 8)
+            # 5. ── SPILL (Physics Only) ──
             temp_stored = avail .- hydro
-            spill_intended = Float64.(a[5:8]) .* avail
-            forced_spill = max.(0.0, temp_stored .- stored_ub)
-            spill = min.(max.(spill_intended, forced_spill), temp_stored)
+            spill = max.(0.0, temp_stored .- stored_ub)
 
             push!(monthly_hydro, sum(hydro))
-            push!(monthly_thermal, sum(thermal))
-            push!(monthly_deficit, sum(deficit))
+            push!(monthly_thermal, thermal_total)
+            push!(monthly_deficit, deficit_total)
             push!(monthly_spill, sum(spill))
             push!(monthly_exchange, sum(exch))
 
+            # Advance the environment safely using the real physics
             obs, _, done, _ = env_step!(env, μ)
         end
 
