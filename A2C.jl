@@ -160,20 +160,24 @@ function env_step!(env::HydrothermalEnv, raw_action::Vector{Float32})
     demand_t = demand_mat[month, :]
     a = sigmoid.(raw_action)
 
-    # 1. ── Exchange (Strategic) ────────────────────────────────────
-    # Assuming action indices 9 to 33 are for exchange
     exchange = reshape(Float64.(a[9:33]), 5, 5) .* exchange_ub_mat
     for i in 1:5
         exchange[i, i] = 0.0
     end
 
-    # Transshipment balance at node 5 (dummy node)
-    inflow_5 = sum(exchange[1:4, 5])
-    outflow_5 = sum(exchange[5, 1:4])
-    if outflow_5 > 1e-8
-        exchange[5, 1:4] .+= (inflow_5 - outflow_5) .* exchange[5, 1:4] ./ outflow_5
+    # 💥 THE REAL FIX: Transshipment Balance (Total In = Total Out)
+    inflow_5 = sum(exchange[1:4, 5])         # Total power arriving at Node 5
+    outflow_5_proposed = sum(exchange[5, 1:4]) # Total power agent wants to leave Node 5
+
+    if outflow_5_proposed > 1e-8
+        # Scale the exports so they perfectly match the imports
+        exchange[5, 1:4] .= exchange[5, 1:4] .* (inflow_5 / outflow_5_proposed)
+    else
+        # If agent guessed 0, just distribute the inflow evenly so it doesn't get trapped
+        exchange[5, 1:4] .= inflow_5 / 4.0
     end
-    exchange = clamp.(exchange, 0.0, exchange_ub_mat)
+
+    exchange = clamp.(exchange, 0.0, exchange_ub_mat)  # Ensure this scaling didn't violate physical line limits
 
     # 2. ── Target Load per Region ──────────────────────────────────
     target_load = zeros(4)
@@ -247,7 +251,14 @@ function env_step!(env::HydrothermalEnv, raw_action::Vector{Float32})
     # The imbalance penalty is GONE because the logic above mathematically guarantees balance!
     total_cost = thermal_cost + deficit_cost + spill_cost_val + exchange_vol_penalty
 
-    #reward = Float32(-total_cost / 1e6)
+    reward = Float32(-total_cost / 1e8)
+
+
+    # 6. ── Cost Calculation (Perfectly Aligned with SDDP) ──────────
+    spill_cost_val = SPILL_COST * sum(spill)
+
+    # Removed exchange_vol_penalty to match SDDP objective
+    total_cost = thermal_cost + deficit_cost + spill_cost_val
     reward = Float32(-total_cost / 1e8)
 
     # 7. ── Advance state ───────────────────────────────────────────
@@ -258,6 +269,7 @@ function env_step!(env::HydrothermalEnv, raw_action::Vector{Float32})
 
     return get_obs(env), reward, done, total_cost
 end
+
 
 # ─────────────────────────────────────────────────────────────────
 # 4. ACTOR-CRITIC NETWORK
@@ -300,30 +312,38 @@ const VF_COEF = 0.5f0
 const ENT_COEF = 0.01f0
 const LOG_2PIE = Float32(log(2π * ℯ))
 
-function a2c_loss(agent::A2CAgent,
-    obs_buf::Vector{Vector{Float32}},
-    act_buf::Vector{Vector{Float32}},
-    returns::Vector{Float32},
-    advantages::Vector{Float32})
-    n = length(obs_buf)
-    lnσ = agent.log_std
-    σ = exp.(lnσ)
-    actor_l = 0.0f0
-    critic_l = 0.0f0
-    entropy = 0.0f0
+function a2c_loss(agent, obs_buf, act_buf, returns, adv)
+    # 1. Convert Vectors of Vectors into Matrices (features × batch_size)
+    obs_mat = reduce(hcat, obs_buf)
+    act_mat = reduce(hcat, act_buf)
 
-    for i in 1:n
-        μ = agent.actor(obs_buf[i])
-        v = agent.critic(obs_buf[i])[1]
-        ε = (act_buf[i] .- μ) ./ σ
-        lp = sum(-0.5f0 .* ε .^ 2 .- lnσ .- 0.5f0 * log(2f0 * Float32(π)))
+    # 2. CRITIC LOSS
+    # Critic outputs a 1×batch_size matrix, we need a flat vector
+    values = vec(agent.critic(obs_mat))
+    critic_loss = mean((returns .- values) .^ 2)
 
-        actor_l -= lp * advantages[i]
-        critic_l += (returns[i] - v)^2
-        entropy += sum(0.5f0 .* (LOG_2PIE .+ 2f0 .* lnσ))
-    end
+    # 3. ACTOR LOSS
+    μ = agent.actor(obs_mat)
+    σ = exp.(agent.log_std)
 
-    return (actor_l + VF_COEF * critic_l - ENT_COEF * entropy) / n
+    # Calculate log probability manually to ensure Flux/Zygote doesn't crash
+    variance = σ .^ 2
+    log_probs = -0.5f0 .* (((act_mat .- μ) .^ 2) ./ variance .+ 2.0f0 .* log.(σ) .+ log(2.0f0 * π))
+
+    # Sum log probabilities across the action dimension for each step
+    sum_log_probs = vec(sum(log_probs, dims=1))
+
+    # Policy gradient loss
+    actor_loss = -mean(sum_log_probs .* adv)
+
+    # 4. ENTROPY BONUS (encourages exploration)
+    # Entropy of a Normal distribution
+    entropy = mean(sum(log.(σ) .+ 0.5f0 .+ 0.5f0 * log(2.0f0 * Float32(π))))
+
+    # Total loss combining all three components
+    total_loss = actor_loss + 0.5f0 * critic_loss - 0.005f0 * entropy
+
+    return total_loss
 end
 
 # ─────────────────────────────────────────────────────────────────
@@ -333,7 +353,7 @@ end
 const GAMMA = 0.99f0
 const LR = 3f-4
 const N_STEPS = 12       # one full seasonal cycle per update
-const N_EPISODES = 10_000
+const N_EPISODES = 5_000
 
 function train_a2c(; seed=42, n_episodes=N_EPISODES)
     rng = MersenneTwister(seed)
@@ -364,10 +384,10 @@ function train_a2c(; seed=42, n_episodes=N_EPISODES)
 
                 next_obs, rew, done, cost = env_step!(env, a)
                 ep_cost += cost
-
+                rew_scaled = rew / 100.0f0
                 push!(obs_buf, obs)
                 push!(act_buf, a)
-                push!(rew_buf, rew)
+                push!(rew_buf, rew_scaled)
                 push!(val_buf, v)
                 push!(done_buf, done)
                 obs = next_obs
