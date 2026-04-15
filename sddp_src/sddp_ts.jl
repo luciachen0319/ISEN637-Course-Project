@@ -10,6 +10,15 @@ using Random
 
 include("save_results_sddp.jl")
 
+
+# Include the exact same scenario generator you use in A2C.jl
+# (Assuming shared_scenarios.jl has the `generate_eval_scenarios` function)
+include("../shared_scenarios.jl")
+
+const N_EVAL = 100
+const EVAL_SEED = 100  # Must match the seed in A2C.jl
+
+
 gamma = Matrix(CSV.read("../data/gamma.csv", DataFrame))[:,2:end]
 
 # Read sigma matrices
@@ -203,15 +212,36 @@ SDDP.train(model,
     #dashboard = true
 )
 
-# Simulate policy
+# Reformat parameters for the scenario generator to match A2C.jl
+# Ensure they are exactly 12 rows (months) x 4 columns (regions)
+gamma_mat = size(gamma, 1) == 12 ? gamma : Matrix(gamma')
+exp_mu_mat = size(exp_mu, 1) == 12 ? exp_mu : Matrix(exp_mu')
+sigma_mats = sigma
+
+# Generate the identical evaluation paths
+scenarios_inflow, scenarios_omega = generate_eval_scenarios(
+    N_EVAL, 24, gamma_mat, sigma_mats, exp_mu_mat, inflow_initial;
+    seed=EVAL_SEED
+)
+
+# Map the scenarios into SDDP's "Historical" format
+# (Stage 1 is deterministic, so noise starts at t=2)
+historical_sampler = SDDP.Historical(
+    [
+        [(t + 1, scenarios_omega[s][t]) for t in 1:23]
+        for s in 1:N_EVAL
+    ]
+)
+
+# Run the simulation using the synchronized paths
 simulations = SDDP.simulate(
     model, 
-    500,
+    N_EVAL,
     [
         :thermal_cost, :deficit_cost, :spill_cost,
         :stored, :spill, :hydro_gen, :deficit, :exchange, :thermal_gen, :inflow
-    ]; 
-    # sampling_scheme = historical
+    ];
+    sampling_scheme = historical_sampler
 )
 
 costs = [sum(stage[:stage_objective] for stage in sim) for sim in simulations]

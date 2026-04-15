@@ -42,7 +42,17 @@ function generate_eval_scenarios(
             month      = mod1(t, 12)
             prev_month = mod1(t - 1, 12)
 
-            noise = exp.(rand(rng, MvNormal(zeros(4), sigma_mats[month])))
+            # Generate the raw normal noise
+            raw_noise = rand(rng, MvNormal(zeros(4), sigma_mats[month]))
+
+            # Extract the standard deviations for the 4 regions (diagonal of the covariance matrix)
+            std_devs = sqrt.(diag(sigma_mats[month]))
+
+            # Clamp the raw noise to +/- 3 standard deviations
+            clamped_noise = clamp.(raw_noise, -3.0 .* std_devs, 3.0 .* std_devs)
+
+            # Exponentiate the clamped noise
+            noise = exp.(clamped_noise)
 
             coef = -noise .* gamma_mat[month, :] .*
                    exp_mu_mat[month, :] ./ (exp_mu_mat[prev_month, :] .+ 1e-8)
