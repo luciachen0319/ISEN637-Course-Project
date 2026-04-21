@@ -2,7 +2,7 @@
 A2C for Hydrothermal Scheduling — Julia implementation
 Mirrors sddp_ts.jl:
   - Same 4 subsystems: SE, S, NE, N
-  - Same PAR(1) inflow model (γ, Σ, exp_mu from data.jl)
+  - Same PAR(1) inflow model (γ, Σ, ㄕㄛmu from data.jl)
   - Thermal: economic dispatch across 95 units (exact per-unit cost)
   - Exchange: learned approximation with anti-cycling penalty
   - Deficit: single-level per subsystem (simplified for training stability)
